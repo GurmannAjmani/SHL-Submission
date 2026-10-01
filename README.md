@@ -1,122 +1,106 @@
-# Grammar scoring from spoken audio
+# Grammar score from speech
 
-Predicts a grammar score between 1.0 and 5.0 for a spoken English answer. The
-metric is mean absolute error (MAE). The notebook
-`DebertaTrainingandcomparison.ipynb` runs the whole pipeline end to end and
-writes `submission.csv`.
+This project gives a grammar score to a spoken English answer. The score is a
+number from 1.0 to 5.0. The metric is the mean absolute error (MAE).
 
-## Results from this run
+The notebook `DebertaTrainingandcomparison.ipynb` does the full task. It reads
+the audio files and writes the submission files.
 
-Out-of-fold MAE across 732 training rows, 5-fold stratified cross-validation:
+The text of this file follows ASD-STE100. The names of the models, the metrics
+and the libraries are technical names. The text keeps them as they are.
 
-| Model | OOF MAE | RMSE | Pearson r | Fold MAE std |
-|---|---|---|---|---|
-| deberta_v3_large | 0.4489 | 0.5717 | 0.826 | 0.024 |
-| deberta_v3_base | 0.4591 | 0.5811 | 0.820 | 0.028 |
-| roberta_large | 0.4680 | 0.5886 | 0.814 | 0.013 |
-| roberta_base | 0.4688 | 0.6007 | 0.807 | 0.025 |
+## Files
 
-Stacker comparison, repeated 5-fold CV, 3 repeats:
-
-| Candidate | CV MAE |
+| File | Contents |
 |---|---|
-| residual_gbm | 0.4285 |
-| mean_of_models | 0.4424 |
-| ridge_stack | 0.4434 |
-| gbm_stack_with_features | 0.4439 |
-| mae_weighted_blend | 0.4454 |
-| best single model | 0.4489 |
-| features_only_gbm | 0.5932 |
+| `DebertaTrainingandcomparison.ipynb` | The full pipeline, with the output of the run |
+| `submission_deberta_v3_large.csv` | The predictions of the DeBERTa-v3 large encoder, for 216 test rows |
+| `README.md` | This file |
 
-The submitted file uses `residual_gbm` with grid snapping, which scored 0.4092
-on out-of-fold predictions.
+## Approach
 
-## Why this configuration
+The task has 732 usable training rows. This is a small number for a transformer
+model. The design therefore keeps the variance low at each step.
 
-DeBERTa-v3 large is the strongest single encoder here. Its disentangled
-attention separates content from position, which suits a task where the same
-words in a different order change the score. It leads every other encoder on
-MAE, RMSE and correlation.
+1. **Transcripts.** Whisper small changes each audio file into text. Whisper
+   removes the fillers and repairs the repeats by default. These items show the
+   grammar quality of the speaker. An initial prompt full of fillers therefore
+   tells Whisper to keep them. The step also keeps the confidence of each
+   segment, the length of each pause and the duration of the audio.
+2. **Features.** The pipeline calculates the word count, the sentence length,
+   the type-token ratio, the filler count, the repeat count, the speech rate and
+   the pause ratio. Only the combination models read these features. The
+   encoders read the transcript.
+3. **Encoders.** Each encoder has a masked mean pooling layer and a linear head.
+   The loss is SmoothL1 on the standardised labels. The optimiser uses a
+   layer-wise learning-rate decay and a higher rate for the head. The schedule
+   is a cosine decay with a warmup.
+4. **Cross-validation.** Four stratified folds give an out-of-fold prediction
+   for each training row. Each fold keeps the weights of the epoch with the
+   lowest validation MAE. The test predictions of the four folds are averaged.
+5. **Combination.** The two encoders and their combinations compete in a
+   repeated 5-fold cross-validation. The candidate with the lowest MAE trains
+   again on all the training rows.
+6. **Submission.** The predictions stay in the label range. The pipeline then
+   moves each prediction to the nearest label on the 0.5 grid.
 
-It is not submitted alone. The stacker averages all four encoders, then adds a
-small gradient-boosted correction learned from the fluency features. That beats
-DeBERTa-v3 large alone by 0.020 MAE. The four encoders make different mistakes,
-so averaging cancels part of the error, and the fluency features carry
-information no text model sees: speech rate, pause length, and Whisper's own
-confidence in the transcript.
+## Results of this run
 
-Grid snapping adds another 0.018. Every training label is a multiple of 0.5, so
-a prediction of 3.47 is better reported as 3.5.
+Two encoders, 4 folds, 6 epochs for each fold, 732 training rows.
 
-## Pipeline
+| Encoder | Out-of-fold MAE | RMSE | Pearson r | Fold MAE std |
+|---|---|---|---|---|
+| deberta_v3_large | 0.4530 | 0.5809 | 0.821 | 0.028 |
+| roberta_large | 0.4864 | 0.6170 | 0.797 | 0.037 |
 
-1. **Transcription.** Whisper small converts audio to text. An initial prompt
-   full of fillers biases it towards keeping disfluencies, which Whisper
-   otherwise repairs. Repeats, false starts and fillers are grammar evidence.
-   Per-segment log-probabilities, pause gaps and audio duration are cached with
-   the transcript.
-2. **Features.** Word and sentence counts, type-token ratio, filler and repeat
-   counts, words per minute, pause ratio, and the Whisper confidence statistics.
-   These feed the stacker, never the transformers.
-3. **Fine-tuning.** Encoder, masked mean pooling, linear head. SmoothL1 loss on
-   standardised labels, layer-wise learning-rate decay, cosine schedule with
-   warmup, mixed precision, early stopping on validation MAE with the best
-   epoch's weights restored.
-4. **Stacking.** Seven candidates compete on repeated CV. The winner is refit on
-   all training rows and applied to the test set.
-5. **Submission.** Clip to the label range, snap to the 0.5 grid, write
-   `submission.csv`. One single-model submission per encoder is written as a
-   fallback.
+The grid step lowers the MAE by a further 0.014.
 
-## Key decisions
+DeBERTa-v3 large is the better of the two encoders. Its disentangled attention
+keeps the content and the position apart. The same words in a different order
+can thus give a different score. The encoder is better than RoBERTa large on all
+three metrics.
 
-- **5-fold CV instead of a single holdout.** A 110-row holdout gave MAE anywhere
-  from 0.43 to 0.77 across epochs of the same run. Model selection on that was
-  guesswork.
-- **Select epochs on MAE, not Pearson.** The highest-correlation epoch can carry
-  a large bias. One DeBERTa base run peaked on Pearson at an epoch whose MAE was
-  0.75.
-- **SmoothL1 on standardised labels.** Closer to the metric than MSE.
-  Standardising removes the first few epochs otherwise spent learning the scale.
-- **Mean pooling, dropout disabled.** A stronger regression head than CLS
-  pooling at this data size.
-- **Dynamic padding to 512 tokens with gradient accumulation.** No truncation of
-  long answers, and an effective batch of 16 rather than 4.
+## How the pipeline improved
 
-## Caveats
+The first version used one 110-row validation split, an MSE loss on the raw
+labels, a CLS head with dropout, and one learning rate for all the layers. Its
+validation MAE moved from 0.43 to 0.77 between the epochs of one run. These
+changes made the result stable and lower:
 
-Out-of-fold MAE is slightly optimistic. Each fold's best epoch is chosen on that
-fold's own validation rows, and the snapping decision was made on out-of-fold
-predictions. Expect the leaderboard score to be somewhat higher than 0.4092.
-Compare variants under this same protocol, and treat the leaderboard as the
-final judge.
+| Change | Reason |
+|---|---|
+| Stratified cross-validation in place of one split | A 110-row split is too small. The model selection was not reliable. |
+| Epoch selection on the MAE, not on the Pearson correlation | The metric is the MAE. An epoch with a high correlation can have a large bias. One run had an MAE of 0.75 at its best Pearson epoch. |
+| SmoothL1 loss on the standardised labels | This loss is nearer to the metric than MSE. The standardised labels also remove the first epochs that only learn the scale. |
+| Cosine decay across the epochs of the run | The first version planned a decay across 75 epochs but stopped near epoch 12. The learning rate thus stayed high. The last epochs now train at a small rate. |
+| Mean pooling and no dropout | This head is better than CLS pooling for a regression task on a small dataset. |
+| Layer-wise learning-rate decay and a separate head rate | The pretrained layers keep their knowledge. The new head learns more quickly. |
+| Dynamic padding to 512 tokens and gradient accumulation | No long answer is cut. The effective batch is 16 and not 4. |
+| A prompt that keeps the disfluencies | Whisper removes the fillers and the repeats by default. This removes the evidence of the fluency. |
+| A combination of the encoders with a correction model | The two encoders make different errors. The mean removes part of the error. The correction model then uses the fluency features, which no encoder reads. |
+| The 0.5 grid step | Each training label is a multiple of 0.5. A prediction of 3.47 is better as 3.5. |
 
-Training rows with a missing label, an empty transcript, or a label of 0 are
-dropped. That leaves 732 of 769 rows.
+The first version of this notebook also trained two base encoders. They were
+less accurate than the two large encoders, so this version does not train them.
+The compute now goes to more folds and more epochs for the large encoders.
 
-## Improvements being tried
+## Possible improvements
 
-Ranked by expected gain per hour of compute.
+1. **Transcript quality.** Make one run with the disfluency prompt and one run
+   without it. Compare the out-of-fold MAE. Also try Whisper medium. A
+   transcription error limits every later step.
+2. **More encoders.** Add ELECTRA large or DeBERTa-v3 small. A different
+   architecture helps a combination more than one more seed.
+3. **Pseudo-labels.** Add the test rows with confident predictions to the
+   training rows. Do this only when the cross-validation setup is stable.
 
-1. **Transcript quality.** Run the pipeline with the disfluency prompt on and
-   off and compare OOF MAE. Try Whisper medium. Transcription errors set a floor
-   under everything downstream.
-2. **More seeds.** `N_SEEDS = 3` averages away part of the fine-tuning variance.
-   Fold predictions are cached, so this resumes after an interruption.
-3. **Hyper-parameters.** `LOSS_BETA` from 0.1 to 0.5, per-model learning rates,
-   dropout on or off, 8 to 15 epochs.
-4. **More diverse encoders.** ELECTRA large or DeBERTa-v3 small. A blend gains
-   more from a different architecture than from another seed of the same one.
-5. **Pseudo-labelling.** Add confident test predictions as extra training rows,
-   once the cross-validation setup is stable.
+## How to run the notebook
 
-## Running it
+The notebook reads the data from
+`/kaggle/input/competitions/shl-hiring-assessment-2026/Dataset_Final`. It writes
+to `RUN_DIR`. A GPU is necessary.
 
-The notebook expects the competition data at
-`/kaggle/input/competitions/shl-hiring-assessment-2026/Dataset_Final` and writes
-to `RUN_DIR`, which defaults to `/kaggle/working/model_comparison_v2`. A GPU is
-required. The full run takes roughly 1 hour 50 minutes on a single accelerator.
-
-Transcripts and per-fold predictions are cached, so a restarted session picks up
-where it stopped. After changing a training setting, delete that model's folder
-under `RUN_DIR`, or the stale cached predictions are reused.
+The notebook caches the transcripts and the fold predictions. An interrupted
+session thus continues from the last fold. A change to a training setting makes
+the cached predictions incorrect. Remove the model folder in `RUN_DIR` before
+you start the notebook again.
